@@ -1,6 +1,3 @@
-// import "util/directorywatcher"
-//
-// TODO Move directorywatcher to its own github repo (along with other util functions?)
 package directorywatcher
 
 import (
@@ -23,6 +20,7 @@ type directoryWatcher struct {
 	Pattern   string // glob pattern
 
 	// Internal details
+	scan      scanFn                 // The installed scanning function
 	path      string                 // the path being watched
 	files     map[string]os.FileInfo // Map of files watched
 	ticker    *time.Ticker           // The interval timer - if the ticker is != nil, then we assume that it's started
@@ -32,24 +30,23 @@ type directoryWatcher struct {
 	Preload bool
 }
 
-/**
- * Usage:
- * 
- * import DW "util/directorywatcher"
- *
- * func main() {
- * 	dw := DW.New(".")
- *	c := dw.AddNewObserver()
- * 	dw.Start()
- *	for {
- *		select {
- *		case args := <-c:
- *			fmt.Printf("%d files changed at %s!\n", len(args.Events), args.At)
- *		}
- * 	}
- * }
- *
- */
+//
+// Usage:
+//
+// import DW "util/directorywatcher"
+//
+// func main() {
+// 	dw := DW.New(".")
+//	c := dw.AddNewObserver()
+// 	dw.Start()
+//	for {
+//		select {
+//		case args := <-c:
+//			fmt.Printf("%d files changed at %s!\n", len(args.Events), args.At)
+//		}
+// 	}
+// }
+//
 func New(path string) (*directoryWatcher, error) {
 	if stat, err := os.Stat(path); err != nil {
 		return nil, err
@@ -62,10 +59,12 @@ func New(path string) (*directoryWatcher, error) {
 		Pattern:   "*",
 		observers: []Observer{},
 		path:      path,
+		scan:      globScanner, // Default is non-recursive
 		files:     make(map[string]os.FileInfo),
 	}, nil
 }
 
+// Takesa map of options, using reflection to set the values that apply.
 func NewOpts(path string, opts map[string]interface{}) (*directoryWatcher, error) {
 	dw, err := New(path)
 	if err != nil {
@@ -106,14 +105,18 @@ func (dw *directoryWatcher) Start() {
 	if dw.ticker != nil {
 		return
 	}
+	if dw.Recursive { // Switch to recursive scanner, if requested
+		dw.scan = recScanner
+	}
+
 	go func() {
 		now := time.Now()
-		if fst := dw.scan1(); !dw.Preload {
+		if fst := dw.scan2(); !dw.Preload {
 			dw.notify(EventsAt{now, fst})
 		}
 		dw.ticker = time.NewTicker(time.Duration(dw.Interval) * time.Millisecond)
 		for now = range dw.ticker.C {
-			dw.notify(EventsAt{now, dw.scan1()})
+			dw.notify(EventsAt{now, dw.scan2()})
 		}
 	}()
 }
@@ -154,33 +157,18 @@ func (dw *directoryWatcher) notify(evAt EventsAt) {
 
 // The actual walking function: Scans and returns a list of events on all the
 // files that somehow changed (added, changed or deleted).
-func (dw *directoryWatcher) scan1() (changed []Event) {
-	touched := make(map[string]bool) // path names of the files seen in a pass
-	if dw.Recursive {
-		filepath.Walk(dw.path, func(path string, info os.FileInfo, err error) error {
-			if info.IsDir() || !matches(dw.Pattern, info.Name()) {
-				return nil
-			}
-			if ev, ok := dw.hasChange(path, info); ok {
-				dw.files[path] = info
-				changed = append(changed, ev)
-			}
-			touched[path] = true
-			return err
-		})
-	} else {
-		matches, _ := filepath.Glob(filepath.Join(dw.path, dw.Pattern))
-		for _, path := range matches {
-			info, err := os.Stat(path)
-			if err != nil || info.IsDir() {
-				continue
-			}
-			if ev, ok := dw.hasChange(path, info); ok {
-				dw.files[path] = info
-				changed = append(changed, ev)
-			}
-			touched[path] = true
+func (dw *directoryWatcher) scan2() (changed []Event) {
+	touched := make(map[string]bool)
+	for pair := range dw.scan(dw.path) {
+		path, info := pair()
+		if info.IsDir() || !matches(dw.Pattern, info.Name()) {
+			continue
 		}
+		if ev, yes := dw.hasChange(path, info); yes {
+			dw.files[path] = info
+			changed = append(changed, ev)
+		}
+		touched[path] = true
 	}
 	for path, info := range dw.files {
 		if !touched[path] {
@@ -196,11 +184,50 @@ func matches(pattern, name string) bool {
 	return err == nil && matched
 }
 
-/**
- * This tells us if a given file has been changed or added.
- *
- * Uses the comma-ok style to indicate whether or not a given file actually changed.
- */
+// Models a pair, as a function, which can be unpacked by doing:
+//
+//	s, fi := f()
+//
+// The advantage of these are that we can construct them anonymously, pass them
+// on a channel and easily pick out its values.
+type strFileInfo func() (string, os.FileInfo)
+
+// Scanning function
+type scanFn func(path string) <-chan strFileInfo
+
+func wrapFn(p string, fi os.FileInfo) strFileInfo {
+	return func() (string, os.FileInfo) { return p, fi }
+}
+
+func recScanner(path string) <-chan strFileInfo {
+	c := make(chan strFileInfo)
+	go func() {
+		filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
+			c <- wrapFn(path, info)
+			return err
+		})
+		close(c)
+	}()
+	return c
+}
+
+func globScanner(path string) <-chan strFileInfo {
+	c := make(chan strFileInfo)
+	go func() {
+		all, _ := filepath.Glob(filepath.Join(path, "*"))
+		for _, p := range all {
+			if info, err := os.Stat(p); err == nil {
+				c <- wrapFn(p, info)
+			}
+		}
+		close(c)
+	}()
+	return c
+}
+
+// This tells us if a given file has been changed or added.
+//
+// Uses the comma-ok style to indicate whether or not a given file actually changed.
 func (dw *directoryWatcher) hasChange(path string, info os.FileInfo) (Event, bool) {
 	if oldInfo, ok := dw.files[path]; ok {
 		return Event{Changed, path, info}, info.ModTime().After(oldInfo.ModTime())
